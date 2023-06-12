@@ -169,7 +169,8 @@ class EuclideanCodebook(nn.Module):
         distrib.broadcast_tensors(self.buffers())
 
     def preprocess(self, x):
-        x = rearrange(x, "... d -> (...) d")
+        # x = rearrange(x, "... d -> (...) d")
+        x = x.reshape([-1, x.shape[-1]])
         return x
 
     def quantize(self, x):
@@ -182,7 +183,9 @@ class EuclideanCodebook(nn.Module):
         embed_ind = dist.max(dim=-1).indices
         return embed_ind
 
-    def postprocess_emb(self, embed_ind, shape):
+    def postprocess_emb(self, embed_ind: torch.Tensor, shape: tp.List[int]):
+        if torch.jit.is_scripting():
+            return embed_ind.view(shape[:-1])
         return embed_ind.view(*shape[:-1])
 
     def dequantize(self, embed_ind):
@@ -203,7 +206,10 @@ class EuclideanCodebook(nn.Module):
         quantize = self.dequantize(embed_ind)
         return quantize
 
+    @torch.jit.ignore
     def forward(self, x):
+        raise SyntaxError
+
         shape, dtype = x.shape, x.dtype
         x = self.preprocess(x)
 
@@ -279,18 +285,23 @@ class VectorQuantization(nn.Module):
     def codebook(self):
         return self._codebook.embed
 
+    @torch.jit.export
     def encode(self, x):
-        x = rearrange(x, "b d n -> b n d")
+        # x = rearrange(x, "b d n -> b n d")
+        x = x.permute(0, 2, 1)
         x = self.project_in(x)
         embed_in = self._codebook.encode(x)
         return embed_in
 
+    @torch.jit.export
     def decode(self, embed_ind):
         quantize = self._codebook.decode(embed_ind)
         quantize = self.project_out(quantize)
-        quantize = rearrange(quantize, "b n d -> b d n")
+        # quantize = rearrange(quantize, "b n d -> b d n")
+        quantize = quantize.permute(0, 2, 1)
         return quantize
 
+    @torch.jit.ignore
     def forward(self, x):
         device = x.device
         x = rearrange(x, "b d n -> b n d")
@@ -326,6 +337,7 @@ class ResidualVectorQuantization(nn.Module):
             [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
         )
 
+    @torch.jit.ignore
     def forward(self, x, n_q: tp.Optional[int] = None):
         quantized_out = 0.0
         residual = x
@@ -346,11 +358,15 @@ class ResidualVectorQuantization(nn.Module):
         out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
         return quantized_out, out_indices, out_losses
 
+    @torch.jit.export
     def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:
         residual = x
         all_indices = []
-        n_q = n_q or len(self.layers)
-        for layer in self.layers[:n_q]:
+        # n_q = n_q or len(self.layers)
+        if n_q is None:
+            n_q = len(self.layers)
+        for i in range(n_q):
+            layer: VectorQuantization = self.layers[i]
             indices = layer.encode(residual)
             quantized = layer.decode(indices)
             residual = residual - quantized
@@ -358,10 +374,13 @@ class ResidualVectorQuantization(nn.Module):
         out_indices = torch.stack(all_indices)
         return out_indices
 
+    @torch.jit.export
     def decode(self, q_indices: torch.Tensor) -> torch.Tensor:
         quantized_out = torch.tensor(0.0, device=q_indices.device)
-        for i, indices in enumerate(q_indices):
-            layer = self.layers[i]
+        n_q = int(q_indices.shape[0])
+        for i in range(n_q):
+            indices = q_indices[i]
+            layer: VectorQuantization = self.layers[i]
             quantized = layer.decode(indices)
             quantized_out = quantized_out + quantized
         return quantized_out

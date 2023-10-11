@@ -142,13 +142,18 @@ class EuclideanCodebook(nn.Module):
         if self.inited:
             return
 
-        embed, cluster_size = kmeans(data, self.codebook_size, self.kmeans_iters)
+        device = data.device
+        embed, cluster_size = kmeans(data.to("cpu"), self.codebook_size, self.kmeans_iters)
+        embed = embed.to(device)
+        cluster_size = cluster_size.to(device)
+
         self.embed.data.copy_(embed)
         self.embed_avg.data.copy_(embed.clone())
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.copy_(torch.Tensor([True]))
         # Make sure all buffers across workers are in sync after initialization
-        distrib.broadcast_tensors(self.buffers())
+        # TODO: Fix distrib
+        # distrib.broadcast_tensors(self.buffers())
 
     def replace_(self, samples, mask):
         modified_codebook = torch.where(
@@ -166,7 +171,8 @@ class EuclideanCodebook(nn.Module):
 
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
-        distrib.broadcast_tensors(self.buffers())
+        # TODO: Fix distrib
+        # distrib.broadcast_tensors(self.buffers())
 
     def preprocess(self, x):
         # x = rearrange(x, "... d -> (...) d")
@@ -307,18 +313,17 @@ class VectorQuantization(nn.Module):
 
         quantize, embed_ind = self._codebook(x)
 
+        loss = torch.tensor([0.0], device=device, requires_grad=self.training)
+        # if self.training:
+        #     # warnings.warn('When using RVQ in training model, first check '
+        #     #               'https://github.com/facebookresearch/encodec/issues/25 . '
+        #     #               'The bug wasn\'t fixed here for reproducibility.')
+        if self.commitment_weight > 0:
+            commit_loss = F.mse_loss(quantize.detach(), x, reduction="none") + F.mse_loss(quantize, x.detach(), reduction="none")
+            loss = loss + torch.sum(commit_loss, dim=[2]) * self.commitment_weight
+
         if self.training:
             quantize = x + (quantize - x).detach()
-
-        loss = torch.tensor([0.0], device=device, requires_grad=self.training)
-
-        if self.training:
-            # warnings.warn('When using RVQ in training model, first check '
-            #               'https://github.com/facebookresearch/encodec/issues/25 . '
-            #               'The bug wasn\'t fixed here for reproducibility.')
-            if self.commitment_weight > 0:
-                commit_loss = F.mse_loss(quantize.detach(), x)
-                loss = loss + commit_loss * self.commitment_weight
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")

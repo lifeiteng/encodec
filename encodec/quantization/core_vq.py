@@ -143,7 +143,7 @@ class EuclideanCodebook(nn.Module):
             return
 
         device = data.device
-        embed, cluster_size = kmeans(data.to("cpu"), self.codebook_size, self.kmeans_iters)
+        embed, cluster_size = kmeans(data, self.codebook_size, self.kmeans_iters)
         embed = embed.to(device)
         cluster_size = cluster_size.to(device)
 
@@ -169,6 +169,7 @@ class EuclideanCodebook(nn.Module):
         if not torch.any(expired_codes):
             return
 
+        print(f"cluster_size {torch.sum(self.cluster_size)} expired_codes {torch.sum(expired_codes)}")
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
         # TODO: Fix distrib
@@ -190,9 +191,7 @@ class EuclideanCodebook(nn.Module):
         return embed_ind
 
     def postprocess_emb(self, embed_ind: torch.Tensor, shape: tp.List[int]):
-        if torch.jit.is_scripting():
-            return embed_ind.view(shape[:-1])
-        return embed_ind.view(*shape[:-1])
+        return embed_ind.view(shape[:-1])
 
     def dequantize(self, embed_ind):
         quantize = F.embedding(embed_ind, self.embed)
@@ -312,22 +311,21 @@ class VectorQuantization(nn.Module):
         x = self.project_in(x)
 
         quantize, embed_ind = self._codebook(x)
-
-        loss = torch.tensor([0.0], device=device, requires_grad=self.training)
         # if self.training:
         #     # warnings.warn('When using RVQ in training model, first check '
         #     #               'https://github.com/facebookresearch/encodec/issues/25 . '
         #     #               'The bug wasn\'t fixed here for reproducibility.')
+        commitment_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
         if self.commitment_weight > 0:
-            commit_loss = F.mse_loss(quantize.detach(), x, reduction="none") + F.mse_loss(quantize, x.detach(), reduction="none")
-            loss = loss + torch.sum(commit_loss, dim=[2]) * self.commitment_weight
+            commitment_loss = self.commitment_weight * F.mse_loss(quantize.detach(), x, reduction="none")
+        codebook_loss = F.mse_loss(quantize, x.detach(), reduction="none")
 
         if self.training:
             quantize = x + (quantize - x).detach()
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
-        return quantize, embed_ind, loss
+        return quantize, embed_ind, codebook_loss + commitment_loss
 
 
 class ResidualVectorQuantization(nn.Module):
@@ -342,15 +340,15 @@ class ResidualVectorQuantization(nn.Module):
 
     @torch.jit.ignore
     def forward(self, x, n_q: tp.Optional[int] = None):
-        quantized_out = 0.0
-        residual = x
+        quantized_first, indices, loss = self.layers[0](x)
 
-        all_losses = []
-        all_indices = []
+        all_losses = [loss]
+        all_indices = [indices]
+        residual = x - quantized_first.detach()
+        quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
-
-        for layer in self.layers[:n_q]:
+        for q, layer in  enumerate(self.layers[1:n_q]):
             quantized, indices, loss = layer(residual)
             residual = residual - quantized.detach()
             quantized_out = quantized_out + quantized
@@ -359,7 +357,7 @@ class ResidualVectorQuantization(nn.Module):
             all_losses.append(loss)
 
         out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
-        return quantized_out, out_indices, out_losses
+        return quantized_out, out_indices, out_losses, quantized_first
 
     @torch.jit.export
     def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:

@@ -22,6 +22,7 @@ class QuantizedResult:
     codes: torch.Tensor
     bandwidth: torch.Tensor  # bandwidth in kb/s used, per batch item.
     penalty: tp.Optional[torch.Tensor] = None
+    quantized_first: torch.Tensor = None  # the first quantized
     metrics: dict = field(default_factory=dict)
 
 
@@ -81,9 +82,11 @@ class ResidualVectorQuantizer(nn.Module):
         """
         bw_per_q = self.get_bandwidth_per_quantizer(frame_rate)
         n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
-        quantized, codes, commit_loss = self.vq(x, n_q=n_q)
+        quantized, codes, commit_loss, quantized_first = self.vq(x, n_q=n_q)
         bw = torch.tensor(n_q * bw_per_q).to(x)
-        return QuantizedResult(quantized, codes, bw, penalty=torch.mean(commit_loss))
+        return QuantizedResult(quantized, codes, bw,
+                               penalty=torch.mean(commit_loss),
+                               quantized_first=quantized_first)
 
     def get_num_quantizers_for_bandwidth(self, frame_rate: int, bandwidth: tp.Optional[float] = None) -> int:
         """Return n_q based on specified target bandwidth.

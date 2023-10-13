@@ -69,7 +69,9 @@ class ResidualVectorQuantizer(nn.Module):
         )
 
     @torch.jit.ignore
-    def forward(self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None) -> QuantizedResult:
+    def forward(self, x: torch.Tensor, frame_rate: int,
+                bandwidth: tp.Optional[float] = None,
+                n_q: int = 0) -> QuantizedResult:
         """Residual vector quantization on the given input tensor.
         Args:
             x (torch.Tensor): Input tensor.
@@ -81,7 +83,9 @@ class ResidualVectorQuantizer(nn.Module):
                 the associated bandwidth and any penalty term for the loss.
         """
         bw_per_q = self.get_bandwidth_per_quantizer(frame_rate)
-        n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
+        if not n_q:
+            n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
+
         quantized, codes, commit_loss, quantized_first = self.vq(x, n_q=n_q)
         bw = torch.tensor(n_q * bw_per_q).to(x)
         return QuantizedResult(quantized, codes, bw,
@@ -91,9 +95,9 @@ class ResidualVectorQuantizer(nn.Module):
     def get_num_quantizers_for_bandwidth(self, frame_rate: int, bandwidth: tp.Optional[float] = None) -> int:
         """Return n_q based on specified target bandwidth.
         """
-        bw_per_q = self.get_bandwidth_per_quantizer(frame_rate)
         n_q = self.n_q
         if bandwidth is not None and bandwidth > 0.:
+            bw_per_q = self.get_bandwidth_per_quantizer(frame_rate)
             # bandwidth is represented as a thousandth of what it is, e.g. 6kbps bandwidth is represented as
             # bandwidth == 6.0
             n_q = int(max(1, math.floor(bandwidth * 1000 / bw_per_q)))

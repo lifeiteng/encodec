@@ -169,7 +169,6 @@ class EuclideanCodebook(nn.Module):
         if not torch.any(expired_codes):
             return
 
-        print(f"cluster_size {torch.sum(self.cluster_size)} expired_codes {torch.sum(expired_codes)}")
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
         # TODO: Fix distrib

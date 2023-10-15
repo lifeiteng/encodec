@@ -112,7 +112,8 @@ class SEANetEncoder(nn.Module):
                  ratios: tp.List[int] = [8, 5, 4, 2], activation: str = 'ELU', activation_params: dict = {'alpha': 1.0},
                  norm: str = 'weight_norm', norm_params: tp.Dict[str, tp.Any] = {}, kernel_size: int = 7,
                  last_kernel_size: int = 7, residual_kernel_size: int = 3, dilation_base: int = 2, causal: bool = False,
-                 pad_mode: str = 'reflect', true_skip: bool = False, compress: int = 2, lstm: int = 2):
+                 pad_mode: str = 'reflect', true_skip: bool = False, compress: int = 2,
+                 lstm: int = 2, lstm_bidirectional: bool = False):
         super().__init__()
         self.channels = channels
         self.dimension = dimension
@@ -151,7 +152,7 @@ class SEANetEncoder(nn.Module):
             mult *= 2
 
         if lstm:
-            model += [SLSTM(mult * n_filters, num_layers=lstm)]
+            model += [SLSTM(mult * n_filters, num_layers=lstm, bidirectional=lstm_bidirectional)]
 
         model += [
             act(**activation_params) if activation != "snake" else Snake1d(mult * n_filters),

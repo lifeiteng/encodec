@@ -46,7 +46,7 @@ class ResidualVectorQuantizer(nn.Module):
         self,
         dimension: int = 256,
         n_q: int = 8,
-        codebook_size: int = 1024,
+        bins: int = 1024,
         codebook_dim: tp.Optional[int] = None,
         ema_update: bool = True,
         decay: float = 0.99,
@@ -58,7 +58,7 @@ class ResidualVectorQuantizer(nn.Module):
         super().__init__()
         self.n_q = n_q
         self.dimension = dimension
-        self.bins = codebook_size
+        self.bins = bins
         self.log2bins = math.log2(self.bins)
         self.decay = decay
         self.kmeans_init = kmeans_init
@@ -66,7 +66,7 @@ class ResidualVectorQuantizer(nn.Module):
         self.threshold_ema_dead_code = threshold_ema_dead_code
         self.vq = ResidualVectorQuantization(
             dim=self.dimension,
-            codebook_size=codebook_size,
+            codebook_size=bins,
             codebook_dim=codebook_dim,
             num_quantizers=self.n_q,
             ema_update=ema_update,

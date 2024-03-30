@@ -152,8 +152,7 @@ class EuclideanCodebook(nn.Module):
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.copy_(torch.Tensor([True]))
         # Make sure all buffers across workers are in sync after initialization
-        # TODO: Fix distrib
-        # distrib.broadcast_tensors(self.buffers())
+        distrib.broadcast_tensors(self.buffers())
 
     def replace_(self, samples, mask):
         modified_codebook = torch.where(
@@ -171,8 +170,7 @@ class EuclideanCodebook(nn.Module):
 
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
-        # TODO: Fix distrib
-        # distrib.broadcast_tensors(self.buffers())
+        distrib.broadcast_tensors(self.buffers())
 
     def preprocess(self, x):
         # x = rearrange(x, "... d -> (...) d")
@@ -311,13 +309,13 @@ class VectorQuantization(nn.Module):
 
         quantize, embed_ind = self._codebook(x)
         # if self.training:
-        #     # warnings.warn('When using RVQ in training model, first check '
-        #     #               'https://github.com/facebookresearch/encodec/issues/25 . '
-        #     #               'The bug wasn\'t fixed here for reproducibility.')
+        #     warnings.warn('When using RVQ in training model, first check '
+        #                   'https://github.com/facebookresearch/encodec/issues/25 . '
+        #                   'The bug wasn\'t fixed here for reproducibility.')
         commitment_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
         if self.commitment_weight > 0:
-            commitment_loss = self.commitment_weight * F.mse_loss(quantize.detach(), x, reduction="none")
-        codebook_loss = F.mse_loss(quantize, x.detach(), reduction="none")
+            commitment_loss = self.commitment_weight * F.mse_loss(quantize.detach(), x, reduction="mean")
+        codebook_loss = F.mse_loss(quantize, x.detach(), reduction="mean")
 
         if self.training:
             quantize = x + (quantize - x).detach()

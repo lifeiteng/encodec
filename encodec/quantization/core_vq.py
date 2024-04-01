@@ -61,6 +61,12 @@ def uniform_init(*shape: int):
     return t
 
 
+def normal_init(*shape: int):
+    t = torch.empty(shape)
+    nn.init.normal_(t)
+    return t
+
+
 def sample_vectors(samples, num: int):
     num_samples, device = samples.shape[0], samples.device
 
@@ -127,7 +133,7 @@ class EuclideanCodebook(nn.Module):
         self.ema_update = ema_update
         self.decay = decay
         self.kmeans_init = kmeans_init
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = uniform_init if not kmeans_init else torch.zeros
+        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = normal_init if not kmeans_init else torch.zeros
         embed = init_fn(codebook_size, dim)
 
         self.codebook_size = codebook_size

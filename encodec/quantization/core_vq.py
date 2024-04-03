@@ -101,6 +101,21 @@ def kmeans(samples, num_clusters: int, num_iters: int = 10):
     return means, bins
 
 
+class DiversityLoss(nn.Module):
+    def __init__(self, codebook_size, temperature: float = 0.9):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.temperature = temperature
+
+    def forward(self, confidence: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        # confidence: (B * L, bins)
+        point_probs = F.softmax(confidence / self.temperature, dim=1)
+        class_probs = torch.mean(point_probs, dim=0)
+        entropy_loss = torch.sum(class_probs * torch.log(class_probs + 1e-6))
+        consistency_loss = torch.sum(-torch.mean(point_probs * torch.log(point_probs + 1e-6), dim=1))
+        return entropy_loss + consistency_loss
+
+
 class EuclideanCodebook(nn.Module):
     """Codebook with Euclidean distance.
     Args:
@@ -147,6 +162,8 @@ class EuclideanCodebook(nn.Module):
         self.register_buffer("embed", embed)
         self.register_buffer("embed_avg", embed.clone())
 
+        self.diversity_loss = DiversityLoss(codebook_size, temperature=0.9)
+
     @torch.jit.ignore
     def init_embed_(self, data):
         if self.inited:
@@ -192,9 +209,10 @@ class EuclideanCodebook(nn.Module):
             x = F.normalize(x)
             embed = F.normalize(embed, dim=0)
 
-        dist = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
-        embed_ind = dist.max(dim=-1).indices
-        return embed_ind
+        # (B*L, N)
+        confidence = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
+        embed_ind = confidence.max(dim=-1).indices
+        return confidence, embed_ind
 
     def postprocess_emb(self, embed_ind: torch.Tensor, shape: tp.List[int]):
         return embed_ind.view(shape[:-1])
@@ -208,7 +226,7 @@ class EuclideanCodebook(nn.Module):
         # pre-process
         x = self.preprocess(x)
         # quantize
-        embed_ind = self.quantize(x)
+        _, embed_ind = self.quantize(x)
         # post-process
         embed_ind = self.postprocess_emb(embed_ind, shape)
         return embed_ind
@@ -224,7 +242,7 @@ class EuclideanCodebook(nn.Module):
 
         self.init_embed_(x)
 
-        embed_ind = self.quantize(x)
+        confidence, embed_ind = self.quantize(x)
         embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
         embed_ind = self.postprocess_emb(embed_ind, shape)
         quantize = self.dequantize(embed_ind)
@@ -243,7 +261,8 @@ class EuclideanCodebook(nn.Module):
                 embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
                 self.embed.data.copy_(embed_normalized)
 
-        return quantize, embed_ind
+        diversity_loss = self.diversity_loss(confidence)
+        return quantize, embed_ind, diversity_loss
 
 
 class VectorQuantization(nn.Module):
@@ -325,7 +344,7 @@ class VectorQuantization(nn.Module):
         x = rearrange(x, "b d n -> b n d")
         x = self.project_in(x)
 
-        quantize, embed_ind = self._codebook(x)
+        quantize, embed_ind, diversity_loss = self._codebook(x)
         # if self.training:
         #     warnings.warn('When using RVQ in training model, first check '
         #                   'https://github.com/facebookresearch/encodec/issues/25 . '
@@ -341,7 +360,7 @@ class VectorQuantization(nn.Module):
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
-        return quantize, embed_ind, commitment_loss, codebook_loss
+        return quantize, embed_ind, commitment_loss, codebook_loss, diversity_loss
 
 
 class ResidualVectorQuantization(nn.Module):
@@ -355,27 +374,32 @@ class ResidualVectorQuantization(nn.Module):
 
     @torch.jit.ignore
     def forward(self, x, n_q: tp.Optional[int] = None):
-        quantized_first, indices, commitment_loss, codebook_loss = self.layers[0](x)
+        quantized_first, indices, commitment_loss, codebook_loss, diversity_loss = self.layers[0](x)
 
-        all_commitment_losses, all_codebook_losses = [commitment_loss], [codebook_loss]
+        all_commitment_losses, all_codebook_losses, all_diversity_losses = (
+            [commitment_loss],
+            [codebook_loss],
+            [diversity_loss],
+        )
         all_indices = [indices]
         residual = x - quantized_first.detach()
         quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
-            quantized, indices, commitment_loss, codebook_loss = layer(residual)
+            quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
             residual = residual - quantized.detach()
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)
             all_commitment_losses.append(commitment_loss)
             all_codebook_losses.append(codebook_loss)
+            all_diversity_losses.append(diversity_loss)
 
-        commitment_loss, codebook_loss, out_indices = map(
-            torch.stack, (all_commitment_losses, all_codebook_losses, all_indices)
+        commitment_loss, codebook_loss, diversity_loss, out_indices = map(
+            torch.stack, (all_commitment_losses, all_codebook_losses, all_diversity_losses, all_indices)
         )
-        return quantized_out, out_indices, commitment_loss, codebook_loss, quantized_first
+        return quantized_out, out_indices, commitment_loss, codebook_loss, diversity_loss, quantized_first
 
     @torch.jit.export
     def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:

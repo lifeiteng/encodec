@@ -23,6 +23,7 @@ class QuantizedResult:
     bandwidth: torch.Tensor  # bandwidth in kb/s used, per batch item.
     commitment_loss: tp.Optional[torch.Tensor] = None
     codebook_loss: tp.Optional[torch.Tensor] = None
+    diversity_loss: tp.Optional[torch.Tensor] = None
     quantized_first: torch.Tensor = None  # the first quantized
     metrics: dict = field(default_factory=dict)
 
@@ -95,7 +96,7 @@ class ResidualVectorQuantizer(nn.Module):
         if not n_q:
             n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
 
-        quantized, codes, commitment_loss, codebook_loss, quantized_first = self.vq(x, n_q=n_q)
+        quantized, codes, commitment_loss, codebook_loss, diversity_loss, quantized_first = self.vq(x, n_q=n_q)
         bw = torch.tensor(n_q * bw_per_q).to(x)
         return QuantizedResult(
             quantized,
@@ -103,6 +104,7 @@ class ResidualVectorQuantizer(nn.Module):
             bw,
             commitment_loss=torch.mean(commitment_loss),
             codebook_loss=torch.mean(codebook_loss),
+            diversity_loss=torch.mean(diversity_loss),
             quantized_first=quantized_first,
         )
 

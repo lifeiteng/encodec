@@ -398,19 +398,25 @@ class ResidualVectorQuantization(nn.Module):
             [diversity_loss],
         )
         all_indices = [indices]
-        residual = x - quantized_first.detach()
+        quantized_first = quantized_first.detach()
+        residual = x - quantized_first
         quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
             quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
-            residual = residual - quantized.detach()
+            quantized = quantized.detach()
+            residual = residual - quantized
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)
             all_commitment_losses.append(commitment_loss)
             all_codebook_losses.append(codebook_loss)
             all_diversity_losses.append(diversity_loss)
+
+        if self.training:
+            # Solving subtle bug with STE and RVQ: https://github.com/facebookresearch/encodec/issues/25
+            quantized_out = x + (quantized_out - x).detach()
 
         commitment_loss, codebook_loss, diversity_loss, out_indices = map(
             torch.stack, (all_commitment_losses, all_codebook_losses, all_diversity_losses, all_indices)

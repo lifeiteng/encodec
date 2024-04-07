@@ -361,6 +361,9 @@ class VectorQuantization(nn.Module):
         x = self.project_in(x)
 
         quantize, embed_ind, diversity_loss = self._codebook(x)
+        if self.training:
+            quantize = x + (quantize - x).detach()
+
         # if self.training:
         #     warnings.warn('When using RVQ in training model, first check '
         #                   'https://github.com/facebookresearch/encodec/issues/25 . '
@@ -370,9 +373,6 @@ class VectorQuantization(nn.Module):
         else:
             commitment_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
         codebook_loss = F.mse_loss(quantize, x.detach(), reduction="mean")
-
-        if self.training:
-            quantize = x + (quantize - x).detach()
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
@@ -398,13 +398,13 @@ class ResidualVectorQuantization(nn.Module):
             [diversity_loss],
         )
         all_indices = [indices]
-        residual = x - quantized_first.detach()
+        residual = x - quantized_first
         quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
             quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
-            residual = residual - quantized.detach()
+            residual = residual - quantized
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)

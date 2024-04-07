@@ -112,8 +112,8 @@ class DiversityLoss(nn.Module):
         point_probs = F.softmax(confidence / self.temperature, dim=1)
         class_probs = torch.mean(point_probs, dim=0)
         entropy_loss = torch.sum(class_probs * torch.log(class_probs + 1e-6))
-        consistency_loss = torch.sum(-torch.mean(point_probs * torch.log(point_probs + 1e-6), dim=1))
-        return entropy_loss + consistency_loss
+        # consistency_loss = torch.sum(-torch.mean(point_probs * torch.log(point_probs + 1e-6), dim=1))
+        return entropy_loss  # + consistency_loss
 
 
 class EuclideanCodebook(nn.Module):
@@ -128,7 +128,7 @@ class EuclideanCodebook(nn.Module):
         ema_update (bool): Whether to use exponential moving average for updating the codebooks.
         decay (float): Decay for exponential moving average over the codebooks.
         epsilon (float): Epsilon value for numerical stability.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
+        threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
     """
@@ -142,25 +142,34 @@ class EuclideanCodebook(nn.Module):
         ema_update: bool = True,
         decay: float = 0.99,
         epsilon: float = 1e-5,
-        threshold_ema_dead_code: int = 2,
+        threshold_ema_dead_code: float = 2,
     ):
         super().__init__()
         self.ema_update = ema_update
         self.decay = decay
+
         self.kmeans_init = kmeans_init
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = normal_init if not kmeans_init else torch.zeros
-        embed = init_fn(codebook_size, dim)
+        self.kmeans_iters = kmeans_iters
 
         self.codebook_size = codebook_size
 
-        self.kmeans_iters = kmeans_iters
         self.epsilon = epsilon
         self.threshold_ema_dead_code = threshold_ema_dead_code
 
-        self.register_buffer("inited", torch.Tensor([not kmeans_init]))
         self.register_buffer("cluster_size", torch.zeros(codebook_size))
-        self.register_buffer("embed", embed)
-        self.register_buffer("embed_avg", embed.clone())
+
+        if not kmeans_init and not ema_update:
+            # make sure that the codebook_loss is used for training
+            self.inited = True
+            self.embed = nn.Embedding(codebook_size, dim)
+            self.embed_avg = None
+        else:
+            self.register_buffer("inited", torch.Tensor([not kmeans_init]))
+            init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = normal_init if not kmeans_init else torch.zeros
+            embed = init_fn(codebook_size, dim)
+
+            self.register_buffer("embed", embed)
+            self.register_buffer("embed_avg", embed.clone())
 
         self.diversity_loss = DiversityLoss(codebook_size, temperature=0.9)
 
@@ -186,7 +195,7 @@ class EuclideanCodebook(nn.Module):
         self.embed.data.copy_(modified_codebook)
 
     def expire_codes_(self, batch_samples):
-        if self.threshold_ema_dead_code == 0:
+        if self.threshold_ema_dead_code <= 0.0:
             return
 
         expired_codes = self.cluster_size < self.threshold_ema_dead_code
@@ -203,7 +212,11 @@ class EuclideanCodebook(nn.Module):
         return x
 
     def quantize(self, x):
-        embed = self.embed.t()
+        if self.embed_avg is None:
+            embed = self.embed.weight.t()
+        else:
+            embed = self.embed.t()
+
         if not self.ema_update:  # DAC
             # L2 normalize encodings and codebook (ViT-VQGAN)
             x = F.normalize(x)
@@ -218,7 +231,10 @@ class EuclideanCodebook(nn.Module):
         return embed_ind.view(shape[:-1])
 
     def dequantize(self, embed_ind):
-        quantize = F.embedding(embed_ind, self.embed)
+        if self.embed_avg is None:
+            quantize = F.embedding(embed_ind, self.embed.weight)
+        else:
+            quantize = F.embedding(embed_ind, self.embed)
         return quantize
 
     def encode(self, x):
@@ -250,9 +266,9 @@ class EuclideanCodebook(nn.Module):
         if self.training:
             # We do the expiry of code at that point as buffers are in sync
             # and all the workers will take the same decision.
-            self.expire_codes_(x)
             ema_inplace(self.cluster_size, embed_onehot.sum(0), self.decay)
             if self.ema_update:
+                self.expire_codes_(x)
                 embed_sum = x.t() @ embed_onehot
                 ema_inplace(self.embed_avg, embed_sum.t(), self.decay)
                 cluster_size = (
@@ -277,7 +293,7 @@ class VectorQuantization(nn.Module):
         epsilon (float): Epsilon value for numerical stability.
         kmeans_init (bool): Whether to use kmeans to initialize the codebooks.
         kmeans_iters (int): Number of iterations used for kmeans initialization.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
+        threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
         commitment_weight (float): Weight for commitment loss.
@@ -293,7 +309,7 @@ class VectorQuantization(nn.Module):
         epsilon: float = 1e-5,
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
-        threshold_ema_dead_code: int = 2,
+        threshold_ema_dead_code: float = 2.0,
         commitment_weight: float = 1.0,
     ):
         super().__init__()

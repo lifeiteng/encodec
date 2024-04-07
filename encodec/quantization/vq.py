@@ -38,7 +38,7 @@ class ResidualVectorQuantizer(nn.Module):
         decay (float): Decay for exponential moving average over the codebooks.
         kmeans_init (bool): Whether to use kmeans to initialize the codebooks.
         kmeans_iters (int): Number of iterations used for kmeans initialization.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
+        threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
     """
@@ -53,7 +53,7 @@ class ResidualVectorQuantizer(nn.Module):
         decay: float = 0.99,
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
-        threshold_ema_dead_code: int = 2,
+        threshold_ema_dead_code: float = 2.0,
         commitment_weight: float = 1.0,
     ):
         super().__init__()

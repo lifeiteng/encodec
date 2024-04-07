@@ -398,13 +398,13 @@ class ResidualVectorQuantization(nn.Module):
             [diversity_loss],
         )
         all_indices = [indices]
-        residual = x - quantized_first.detach()
+        residual = x - quantized_first
         quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
             quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
-            residual = residual - quantized.detach()
+            residual = residual - quantized
             quantized_out = quantized_out + quantized
 
             all_indices.append(indices)

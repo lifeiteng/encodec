@@ -27,7 +27,9 @@ class SLSTM(nn.Module):
     def forward(self, x):
         x = x.permute(2, 0, 1)
         with torch.autocast(enabled=False, device_type=x.device.type):  # LSTM doesn't support bfloat16
-            y, _ = self.lstm(x)
+            dtype = x.dtype
+            y, _ = self.lstm(x.to(torch.float32))
+            y = y.to(dtype=dtype)
 
         if self.skip:
             y = y + x

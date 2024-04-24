@@ -54,7 +54,6 @@ class ResidualVectorQuantizer(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
-        commitment_weight: float = 1.0,
     ):
         super().__init__()
         self.n_q = n_q
@@ -75,7 +74,6 @@ class ResidualVectorQuantizer(nn.Module):
             kmeans_init=self.kmeans_init,
             kmeans_iters=self.kmeans_iters,
             threshold_ema_dead_code=self.threshold_ema_dead_code,
-            commitment_weight=commitment_weight,
         )
 
     @torch.jit.ignore

@@ -204,7 +204,7 @@ class EuclideanCodebook(nn.Module):
 
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
-        distrib.broadcast_tensors(self.buffers())
+        distrib.broadcast_tensors([self.embed])
 
     def preprocess(self, x):
         # x = rearrange(x, "... d -> (...) d")
@@ -296,7 +296,6 @@ class VectorQuantization(nn.Module):
         threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
-        commitment_weight (float): Weight for commitment loss.
     """
 
     def __init__(
@@ -310,7 +309,6 @@ class VectorQuantization(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
-        commitment_weight: float = 1.0,
     ):
         super().__init__()
         _codebook_dim: int = default(codebook_dim, dim)
@@ -318,9 +316,7 @@ class VectorQuantization(nn.Module):
         requires_projection = _codebook_dim != dim
         self.project_in = weight_norm(nn.Linear(dim, _codebook_dim)) if requires_projection else nn.Identity()
         self.project_out = weight_norm(nn.Linear(_codebook_dim, dim)) if requires_projection else nn.Identity()
-
         self.epsilon = epsilon
-        self.commitment_weight = commitment_weight
 
         self._codebook = EuclideanCodebook(
             dim=_codebook_dim,
@@ -356,19 +352,16 @@ class VectorQuantization(nn.Module):
 
     @torch.jit.ignore
     def forward(self, x):
-        device = x.device
         x = rearrange(x, "b d n -> b n d")
         x = self.project_in(x)
 
         quantize, embed_ind, diversity_loss = self._codebook(x)
+
         # if self.training:
         #     warnings.warn('When using RVQ in training model, first check '
         #                   'https://github.com/facebookresearch/encodec/issues/25 . '
         #                   'The bug wasn\'t fixed here for reproducibility.')
-        if self.commitment_weight > 0:
-            commitment_loss = self.commitment_weight * F.mse_loss(quantize.detach(), x, reduction="mean")
-        else:
-            commitment_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
+        commitment_loss = F.mse_loss(quantize.detach(), x, reduction="mean")
         codebook_loss = F.mse_loss(quantize, x.detach(), reduction="mean")
 
         if self.training:
@@ -398,14 +391,13 @@ class ResidualVectorQuantization(nn.Module):
             [diversity_loss],
         )
         all_indices = [indices]
-        quantized_first = quantized_first.detach()
+
         residual = x - quantized_first
         quantized_out = quantized_first
 
         n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
             quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
-            quantized = quantized.detach()
             residual = residual - quantized
             quantized_out = quantized_out + quantized
 

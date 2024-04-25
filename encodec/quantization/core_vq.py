@@ -271,7 +271,6 @@ class EuclideanCodebook(nn.Module):
         confidence, embed_ind = self.quantize(x)
         embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
         embed_ind = self.postprocess_emb(embed_ind, shape)
-        quantize = self.dequantize(embed_ind)
 
         if self.training:
             # We do the expiry of code at that point as buffers are in sync
@@ -286,6 +285,8 @@ class EuclideanCodebook(nn.Module):
                 )
                 embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
                 self.embed.data.copy_(embed_normalized)
+
+        quantize = self.dequantize(embed_ind)
 
         diversity_loss = self.diversity_loss(confidence)
         return quantize, embed_ind, diversity_loss

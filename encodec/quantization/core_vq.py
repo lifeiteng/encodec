@@ -143,6 +143,7 @@ class EuclideanCodebook(nn.Module):
         decay: float = 0.99,
         epsilon: float = 1e-5,
         threshold_ema_dead_code: float = 2,
+        affine_transform: bool = False,
     ):
         super().__init__()
         self.ema_update = ema_update
@@ -165,13 +166,18 @@ class EuclideanCodebook(nn.Module):
             self.embed_avg = None
         else:
             self.register_buffer("inited", torch.Tensor([not kmeans_init]))
-            init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = normal_init if not kmeans_init else torch.zeros
+            init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = uniform_init if not kmeans_init else torch.zeros
             embed = init_fn(codebook_size, dim)
 
             self.register_buffer("embed", embed)
             self.register_buffer("embed_avg", embed.clone())
 
         self.diversity_loss = DiversityLoss(codebook_size, temperature=0.9)
+
+        self.affine_transform = affine_transform
+        if affine_transform:
+            self.affine_scale = nn.parameter.Parameter(torch.zeros(dim, 1))
+            self.affine_bias = nn.parameter.Parameter(torch.zeros(dim, 1))
 
     @torch.jit.ignore
     def init_embed_(self, data):
@@ -217,7 +223,11 @@ class EuclideanCodebook(nn.Module):
         else:
             embed = self.embed.t()
 
-        if not self.ema_update:  # DAC
+        # affine
+        if self.affine_transform:
+            embed = embed * (1.0 + self.affine_scale) + self.affine_bias
+
+        if not self.ema_update and not self.affine_transform:  # DAC
             # L2 normalize encodings and codebook (ViT-VQGAN)
             x = F.normalize(x)
             embed = F.normalize(embed, dim=0)
@@ -296,6 +306,7 @@ class VectorQuantization(nn.Module):
         threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
+        affine_transform: (bool): whether apply AffineTransform on coodbook.
     """
 
     def __init__(
@@ -309,6 +320,7 @@ class VectorQuantization(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
+        affine_transform: bool = False,
     ):
         super().__init__()
         _codebook_dim: int = default(codebook_dim, dim)
@@ -327,6 +339,7 @@ class VectorQuantization(nn.Module):
             decay=decay,
             epsilon=epsilon,
             threshold_ema_dead_code=threshold_ema_dead_code,
+            affine_transform=affine_transform,
         )
         self.codebook_size = codebook_size
 

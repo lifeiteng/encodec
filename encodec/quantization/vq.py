@@ -41,6 +41,7 @@ class ResidualVectorQuantizer(nn.Module):
         threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
+        affine_transform: (bool): whether apply AffineTransform on coodbook.
     """
 
     def __init__(
@@ -54,6 +55,7 @@ class ResidualVectorQuantizer(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
+        affine_transform: bool = False,
     ):
         super().__init__()
         self.n_q = n_q
@@ -74,6 +76,7 @@ class ResidualVectorQuantizer(nn.Module):
             kmeans_init=self.kmeans_init,
             kmeans_iters=self.kmeans_iters,
             threshold_ema_dead_code=self.threshold_ema_dead_code,
+            affine_transform=affine_transform,
         )
 
     @torch.jit.ignore
@@ -100,9 +103,9 @@ class ResidualVectorQuantizer(nn.Module):
             quantized,
             codes,
             bw,
-            commitment_loss=torch.mean(commitment_loss),
-            codebook_loss=torch.mean(codebook_loss),
-            diversity_loss=torch.mean(diversity_loss),
+            commitment_loss=commitment_loss,
+            codebook_loss=codebook_loss,
+            diversity_loss=diversity_loss,
             quantized_first=quantized_first,
         )
 

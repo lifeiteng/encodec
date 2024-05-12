@@ -217,7 +217,7 @@ class EuclideanCodebook(nn.Module):
         x = x.reshape([-1, x.shape[-1]])
         return x
 
-    def quantize(self, x):
+    def quantize(self, x, topk: int = 1):
         if self.embed_avg is None:
             embed = self.embed.weight.t()
         else:
@@ -232,9 +232,15 @@ class EuclideanCodebook(nn.Module):
             x = F.normalize(x)
             embed = F.normalize(embed, dim=0)
 
-        # (B*L, N)
-        confidence = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
-        embed_ind = confidence.max(dim=-1).indices
+        if topk > 1:
+            # (B*L, N)
+            distance = torch.cdist(x, embed.t(), p=2)
+            confidence, embed_ind = distance.topk(topk, dim=-1, largest=False)
+        else:
+            # (B*L, N)
+            confidence = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
+            embed_ind = confidence.max(dim=-1).indices
+
         return confidence, embed_ind
 
     def postprocess_emb(self, embed_ind: torch.Tensor, shape: tp.List[int]):
@@ -260,6 +266,11 @@ class EuclideanCodebook(nn.Module):
     def decode(self, embed_ind):
         quantize = self.dequantize(embed_ind)
         return quantize
+
+    def beamsearch(self, x, num_beams: int = 2):
+        distance, embed_ind = self.quantize(x, topk=num_beams)
+        quantize = [self.dequantize(embed_ind[..., i]) for i in range(num_beams)]
+        return distance, quantize, embed_ind
 
     @torch.jit.ignore
     def forward(self, x):
@@ -364,9 +375,15 @@ class VectorQuantization(nn.Module):
         quantize = quantize.permute(0, 2, 1)
         return quantize
 
+    def beamsearch(self, x, num_beams: int = 2):
+        # x \in bxn d
+        x = self.project_in(x)
+        distance, quantize, embed_ind = self._codebook.beamsearch(x, num_beams=num_beams)
+        quantize = torch.stack([self.project_out(q) for q in quantize], dim=-1)
+        return distance, quantize, embed_ind
+
     @torch.jit.ignore
     def forward(self, x):
-        x = rearrange(x, "b d n -> b n d")
         x = self.project_in(x)
 
         quantize, embed_ind, diversity_loss = self._codebook(x)
@@ -382,7 +399,6 @@ class VectorQuantization(nn.Module):
             quantize = x + (quantize - x).detach()
 
         quantize = self.project_out(quantize)
-        quantize = rearrange(quantize, "b n d -> b d n")
         return quantize, embed_ind, commitment_loss, codebook_loss, diversity_loss
 
 
@@ -395,8 +411,40 @@ class ResidualVectorQuantization(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([VectorQuantization(**kwargs) for _ in range(num_quantizers)])
 
+    def beamsearch(self, x: torch.Tensor, n_q: int = 2, num_beams: int = 1):
+        x = rearrange(x, "b d n -> b n d")
+        D = x.shape[-1]  # D
+        x = x.reshape([-1, D])  # BxD, B=bxn
+        # N = num_beams
+        # BxN
+        distances, quantizes, indices = self.layers[0].beamsearch(x, num_beams=num_beams)
+        all_indices = [indices]
+
+        x = x.unsqueeze(-1)  # BxDx1
+        for q, layer in enumerate(self.layers[1:n_q]):
+            residual = x - quantizes  # BxDxN
+            # (BxN)xN
+            distances, quantizes, _indices = layer.beamsearch(residual.reshape([-1, D]), num_beams=num_beams)
+            _, mini = torch.topk(
+                distances.reshape([-1, num_beams * num_beams]), num_beams, dim=1, largest=False
+            )  # BxNxN -> BxN
+
+            all_indices[-1] = torch.scatter(all_indices[-1], dim=-1, index=mini // num_beams)  # BxN
+
+            _indices = _indices[:, mini % num_beams]  # BxN
+            all_indices.append(_indices)
+
+            x = residual - quantizes[..., _indices]  # BxNxD
+
+        out_indices = torch.stack(all_indices, dim=-1)
+        return out_indices
+
     @torch.jit.ignore
-    def forward(self, x, n_q: tp.Optional[int] = None):
+    def forward(self, x, n_q: tp.Optional[int] = None, num_beams: int = 1):
+        if num_beams > 1 and n_q > 1:
+            return self.beamsearch(x, n_q, num_beams)
+
+        x = rearrange(x, "b d n -> b n d")
         quantized_first, indices, commitment_loss, codebook_loss, diversity_loss = self.layers[0](x)
 
         all_commitment_losses, all_codebook_losses, all_diversity_losses = (
@@ -427,6 +475,8 @@ class ResidualVectorQuantization(nn.Module):
         commitment_loss, codebook_loss, diversity_loss, out_indices = map(
             torch.stack, (all_commitment_losses, all_codebook_losses, all_diversity_losses, all_indices)
         )
+        quantized_out = rearrange(quantized_out, "b n d -> b d n")
+        quantized_first = rearrange(quantized_first, "b n d -> b d n")
         return quantized_out, out_indices, commitment_loss, codebook_loss, diversity_loss, quantized_first
 
     @torch.jit.export

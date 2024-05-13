@@ -86,7 +86,7 @@ class ResidualVectorQuantizer(nn.Module):
         frame_rate: int,
         bandwidth: tp.Optional[float] = None,
         n_q: int = 0,
-        num_beams: int = 1,
+        num_beams: int = 0,
     ) -> QuantizedResult:
         """Residual vector quantization on the given input tensor.
         Args:
@@ -135,7 +135,7 @@ class ResidualVectorQuantizer(nn.Module):
 
     @torch.jit.export
     def encode(
-        self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None, n_q: int = 0
+        self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None, n_q: int = 0, num_beams: int = 0
     ) -> torch.Tensor:
         """Encode a given input tensor with the specified frame rate at the given bandwidth.
         The RVQ encode method sets the appropriate number of quantizers to use
@@ -143,7 +143,7 @@ class ResidualVectorQuantizer(nn.Module):
         """
         if not n_q:
             n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
-        codes = self.vq.encode(x, n_q=n_q)
+        codes = self.vq.encode(x, n_q=n_q, num_beams=num_beams)
         return codes
 
     @torch.jit.export

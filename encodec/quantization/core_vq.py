@@ -217,7 +217,7 @@ class EuclideanCodebook(nn.Module):
         x = x.reshape([-1, x.shape[-1]])
         return x
 
-    def quantize(self, x, topk: int = 1, indices: tp.Optional[torch.Tensor] = None):
+    def quantize(self, x, topk: int = 0, indices: tp.Optional[torch.Tensor] = None):
         if self.embed_avg is None:
             embed = self.embed.weight.t()
         else:
@@ -232,7 +232,7 @@ class EuclideanCodebook(nn.Module):
             x = F.normalize(x)
             embed = F.normalize(embed, dim=0)
 
-        if topk > 1:
+        if topk > 0:
             # (B*L, N)
             distance = torch.cdist(x, embed.t(), p=2)
             confidence, embed_ind = distance.topk(topk, dim=-1, largest=False)
@@ -254,14 +254,15 @@ class EuclideanCodebook(nn.Module):
             quantize = F.embedding(embed_ind, self.embed.weight)
         else:
             quantize = F.embedding(embed_ind, self.embed)
+
         return quantize
 
-    def encode(self, x, indices: tp.Optional[torch.Tensor] = None):
+    def encode(self, x):
         shape = x.shape
         # pre-process
         x = self.preprocess(x)
         # quantize
-        _, embed_ind = self.quantize(x, indices=indices)
+        _, embed_ind = self.quantize(x)
         # post-process
         embed_ind = self.postprocess_emb(embed_ind, shape)
         return embed_ind
@@ -363,11 +364,11 @@ class VectorQuantization(nn.Module):
         return self._codebook.embed
 
     @torch.jit.export
-    def encode(self, x, indices: tp.Optional[torch.Tensor] = None):
+    def encode(self, x):
         # x = rearrange(x, "b d n -> b n d")
         x = x.permute(0, 2, 1)
         x = self.project_in(x)
-        embed_in = self._codebook.encode(x, indices=indices)
+        embed_in = self._codebook.encode(x)
         return embed_in
 
     @torch.jit.export
@@ -382,7 +383,7 @@ class VectorQuantization(nn.Module):
         # x \in bxn d
         x = self.project_in(x)
         distance, quantize, embed_ind = self._codebook.beamsearch(x, num_beams=num_beams)
-        quantize = torch.stack([self.project_out(q) for q in quantize], dim=-1)
+        quantize = torch.stack([self.project_out(q) for q in quantize], dim=1)  # [BxNxD]
         return distance, quantize, embed_ind
 
     @torch.jit.ignore
@@ -422,30 +423,28 @@ class ResidualVectorQuantization(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([VectorQuantization(**kwargs) for _ in range(num_quantizers)])
 
+    @torch.no_grad()
     def beamsearch(self, x: torch.Tensor, n_q: int = 2, num_beams: int = 1):
-        xx = rearrange(x, "b d n -> b n d")
+        x = rearrange(x, "b d n -> b n d")
         D = x.shape[-1]  # D
-        x = xx.reshape([-1, D])  # BxD, B=bxn
+        x = x.reshape([-1, D])  # BxD, B=bxn
         # N = num_beams
         # BxN
         distances, quantizes, indices = self.layers[0].beamsearch(x, num_beams=num_beams)
-        quantizes = quantizes.permute(0, 2, 1)
         all_indices = [indices]
 
-        x = x.unsqueeze(1)  # BxDx1
-        for q, layer in enumerate(self.layers[1:n_q]):
-            residual = x - quantizes  # BxNxD
+        residual = x.unsqueeze(1) - quantizes  # BxNxD
+        for _, layer in enumerate(self.layers[1:n_q]):
             # (BxN)xN
-            distances, quantizes, _indices = layer.beamsearch(residual.reshape([-1, D]), num_beams=num_beams)
-            _, mini = torch.topk(
+            distances2, quantizes, _indices = layer.beamsearch(residual.reshape([-1, D]), num_beams=num_beams)
+
+            distances = distances.unsqueeze(-1) + distances2.reshape([-1, num_beams, num_beams])
+            distances, mini = torch.topk(
                 distances.reshape([-1, num_beams * num_beams]), num_beams, dim=1, largest=False
             )  # BxNxN -> BxN
             _indices = torch.gather(_indices.reshape([-1, num_beams * num_beams]), dim=1, index=mini)
-
-            quantizes = quantizes.permute(0, 2, 1).reshape([-1, num_beams * num_beams, D])
-            quantizes = gather_seq(quantizes, mini)
-
-            x = residual - quantizes  # BxNxD
+            quantizes = gather_seq(quantizes.reshape([-1, num_beams * num_beams, D]), mini)
+            residual = gather_seq(residual, mini // num_beams) - quantizes  # BxNxD
 
             # Update all_indices[-1]
             all_indices[-1] = torch.gather(all_indices[-1], dim=1, index=mini // num_beams)
@@ -457,7 +456,7 @@ class ResidualVectorQuantization(nn.Module):
     @torch.jit.ignore
     def forward(self, x, n_q: tp.Optional[int] = None, num_beams: int = 1):
         n_q = n_q or len(self.layers)
-        if num_beams > 1 and n_q > 1:
+        if num_beams > 0 and n_q > 0:
             out_indices = self.beamsearch(x, n_q, num_beams)
         else:
             out_indices = [None] * n_q
@@ -478,7 +477,9 @@ class ResidualVectorQuantization(nn.Module):
         quantized_out = quantized_first
 
         for q, layer in enumerate(self.layers[1:n_q]):
-            quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual, indices=out_indices[q])
+            quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(
+                residual, indices=out_indices[1 + q]
+            )
             residual = residual - quantized
             quantized_out = quantized_out + quantized
 
@@ -491,6 +492,10 @@ class ResidualVectorQuantization(nn.Module):
             # Solving subtle bug with STE and RVQ: https://github.com/facebookresearch/encodec/issues/25
             quantized_out = x + (quantized_out - x).detach()
 
+        # if num_beams > 0 and n_q > 0:
+        #     _out_indices = torch.stack(all_indices, dim=0)
+        #     assert torch.all(_out_indices == out_indices.reshape([n_q, x.shape[0], x.shape[1]]))
+
         commitment_loss, codebook_loss, diversity_loss, out_indices = map(
             torch.stack, (all_commitment_losses, all_codebook_losses, all_diversity_losses, all_indices)
         )
@@ -500,20 +505,19 @@ class ResidualVectorQuantization(nn.Module):
 
     @torch.jit.export
     def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None, num_beams: int = 1) -> torch.Tensor:
-        residual = x
-        all_indices = []
         # n_q = n_q or len(self.layers)
         if n_q is None:
             n_q = len(self.layers)
 
         if num_beams > 1 and n_q > 1:
             out_indices = self.beamsearch(x, n_q, num_beams)
-        else:
-            out_indices = [None] * n_q
+            return out_indices.reshape([n_q, x.shape[0], x.shape[-1]])  # [Q, B, N]
 
+        residual = x
+        all_indices = []
         for i in range(n_q):
             layer: VectorQuantization = self.layers[i]
-            indices = layer.encode(residual, indices=out_indices[i])
+            indices = layer.encode(residual)
             quantized = layer.decode(indices)
             residual = residual - quantized
             all_indices.append(indices)

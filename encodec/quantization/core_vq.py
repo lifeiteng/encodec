@@ -434,20 +434,21 @@ class ResidualVectorQuantization(nn.Module):
         all_indices = [indices]
 
         residual = x.unsqueeze(1) - quantizes  # BxNxD
-        for _, layer in enumerate(self.layers[1:n_q]):
+        for q, layer in enumerate(self.layers[1:n_q]):
             # (BxN)xN
             distances2, quantizes, _indices = layer.beamsearch(residual.reshape([-1, D]), num_beams=num_beams)
-
             distances = distances.unsqueeze(-1) + distances2.reshape([-1, num_beams, num_beams])
             distances, mini = torch.topk(
                 distances.reshape([-1, num_beams * num_beams]), num_beams, dim=1, largest=False
             )  # BxNxN -> BxN
             _indices = torch.gather(_indices.reshape([-1, num_beams * num_beams]), dim=1, index=mini)
             quantizes = gather_seq(quantizes.reshape([-1, num_beams * num_beams, D]), mini)
-            residual = gather_seq(residual, mini // num_beams) - quantizes  # BxNxD
 
-            # Update all_indices[-1]
-            all_indices[-1] = torch.gather(all_indices[-1], dim=1, index=mini // num_beams)
+            mini = mini // num_beams
+            residual = gather_seq(residual, mini) - quantizes  # BxNxD
+            # Update all_indices
+            for k, __indices in enumerate(all_indices):
+                all_indices[k] = torch.gather(__indices, dim=1, index=mini)
             all_indices.append(_indices)
 
         out_indices = torch.stack(all_indices, dim=-1)[:, 0]  # (BN) Q

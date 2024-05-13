@@ -256,12 +256,12 @@ class EuclideanCodebook(nn.Module):
             quantize = F.embedding(embed_ind, self.embed)
         return quantize
 
-    def encode(self, x):
+    def encode(self, x, indices: tp.Optional[torch.Tensor] = None):
         shape = x.shape
         # pre-process
         x = self.preprocess(x)
         # quantize
-        _, embed_ind = self.quantize(x)
+        _, embed_ind = self.quantize(x, indices=indices)
         # post-process
         embed_ind = self.postprocess_emb(embed_ind, shape)
         return embed_ind
@@ -363,11 +363,11 @@ class VectorQuantization(nn.Module):
         return self._codebook.embed
 
     @torch.jit.export
-    def encode(self, x):
+    def encode(self, x, indices: tp.Optional[torch.Tensor] = None):
         # x = rearrange(x, "b d n -> b n d")
         x = x.permute(0, 2, 1)
         x = self.project_in(x)
-        embed_in = self._codebook.encode(x)
+        embed_in = self._codebook.encode(x, indices=indices)
         return embed_in
 
     @torch.jit.export
@@ -499,15 +499,21 @@ class ResidualVectorQuantization(nn.Module):
         return quantized_out, out_indices, commitment_loss, codebook_loss, diversity_loss, quantized_first
 
     @torch.jit.export
-    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None, num_beams: int = 1) -> torch.Tensor:
         residual = x
         all_indices = []
         # n_q = n_q or len(self.layers)
         if n_q is None:
             n_q = len(self.layers)
+
+        if num_beams > 1 and n_q > 1:
+            out_indices = self.beamsearch(x, n_q, num_beams)
+        else:
+            out_indices = [None] * n_q
+
         for i in range(n_q):
             layer: VectorQuantization = self.layers[i]
-            indices = layer.encode(residual)
+            indices = layer.encode(residual, indices=out_indices[i])
             quantized = layer.decode(indices)
             residual = residual - quantized
             all_indices.append(indices)

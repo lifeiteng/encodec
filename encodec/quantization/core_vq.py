@@ -143,6 +143,7 @@ class EuclideanCodebook(nn.Module):
         decay: float = 0.99,
         epsilon: float = 1e-5,
         threshold_ema_dead_code: float = 2,
+        affine_transform: bool = False,
     ):
         super().__init__()
         self.ema_update = ema_update
@@ -165,13 +166,18 @@ class EuclideanCodebook(nn.Module):
             self.embed_avg = None
         else:
             self.register_buffer("inited", torch.Tensor([not kmeans_init]))
-            init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = normal_init if not kmeans_init else torch.zeros
+            init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = uniform_init if not kmeans_init else torch.zeros
             embed = init_fn(codebook_size, dim)
 
             self.register_buffer("embed", embed)
             self.register_buffer("embed_avg", embed.clone())
 
         self.diversity_loss = DiversityLoss(codebook_size, temperature=0.9)
+
+        self.affine_transform = affine_transform
+        if affine_transform:
+            self.affine_scale = nn.parameter.Parameter(torch.zeros(dim, 1))
+            self.affine_bias = nn.parameter.Parameter(torch.zeros(dim, 1))
 
     @torch.jit.ignore
     def init_embed_(self, data):
@@ -204,27 +210,40 @@ class EuclideanCodebook(nn.Module):
 
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)
-        distrib.broadcast_tensors(self.buffers())
+        distrib.broadcast_tensors([self.embed])
 
     def preprocess(self, x):
         # x = rearrange(x, "... d -> (...) d")
         x = x.reshape([-1, x.shape[-1]])
         return x
 
-    def quantize(self, x):
+    def quantize(self, x, topk: int = 0, indices: tp.Optional[torch.Tensor] = None):
         if self.embed_avg is None:
             embed = self.embed.weight.t()
         else:
             embed = self.embed.t()
 
-        if not self.ema_update:  # DAC
+        # affine
+        if self.affine_transform:
+            embed = embed * (1.0 + self.affine_scale) + self.affine_bias
+
+        if not self.ema_update and not self.affine_transform:  # DAC
             # L2 normalize encodings and codebook (ViT-VQGAN)
             x = F.normalize(x)
             embed = F.normalize(embed, dim=0)
 
-        # (B*L, N)
-        confidence = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
-        embed_ind = confidence.max(dim=-1).indices
+        if topk > 0:
+            # (B*L, N)
+            distance = torch.cdist(x, embed.t(), p=2)
+            confidence, embed_ind = distance.topk(topk, dim=-1, largest=False)
+        else:
+            # (B*L, N)
+            confidence = -(x.pow(2).sum(1, keepdim=True) - 2 * x @ embed + embed.pow(2).sum(0, keepdim=True))
+            embed_ind = confidence.max(dim=-1).indices
+
+        if indices is not None:
+            return confidence, indices
+
         return confidence, embed_ind
 
     def postprocess_emb(self, embed_ind: torch.Tensor, shape: tp.List[int]):
@@ -235,6 +254,7 @@ class EuclideanCodebook(nn.Module):
             quantize = F.embedding(embed_ind, self.embed.weight)
         else:
             quantize = F.embedding(embed_ind, self.embed)
+
         return quantize
 
     def encode(self, x):
@@ -251,17 +271,21 @@ class EuclideanCodebook(nn.Module):
         quantize = self.dequantize(embed_ind)
         return quantize
 
+    def beamsearch(self, x, num_beams: int = 2):
+        distance, embed_ind = self.quantize(x, topk=num_beams)
+        quantize = [self.dequantize(embed_ind[..., i]) for i in range(num_beams)]
+        return distance, quantize, embed_ind
+
     @torch.jit.ignore
-    def forward(self, x):
+    def forward(self, x, indices: tp.Optional[torch.Tensor] = None):
         shape, dtype = x.shape, x.dtype
         x = self.preprocess(x)
 
         self.init_embed_(x)
 
-        confidence, embed_ind = self.quantize(x)
+        confidence, embed_ind = self.quantize(x, indices=indices)
         embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
         embed_ind = self.postprocess_emb(embed_ind, shape)
-        quantize = self.dequantize(embed_ind)
 
         if self.training:
             # We do the expiry of code at that point as buffers are in sync
@@ -276,6 +300,8 @@ class EuclideanCodebook(nn.Module):
                 )
                 embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
                 self.embed.data.copy_(embed_normalized)
+
+        quantize = self.dequantize(embed_ind)
 
         diversity_loss = self.diversity_loss(confidence)
         return quantize, embed_ind, diversity_loss
@@ -296,7 +322,7 @@ class VectorQuantization(nn.Module):
         threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
-        commitment_weight (float): Weight for commitment loss.
+        affine_transform: (bool): whether apply AffineTransform on coodbook.
     """
 
     def __init__(
@@ -310,7 +336,7 @@ class VectorQuantization(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
-        commitment_weight: float = 1.0,
+        affine_transform: bool = False,
     ):
         super().__init__()
         _codebook_dim: int = default(codebook_dim, dim)
@@ -318,9 +344,7 @@ class VectorQuantization(nn.Module):
         requires_projection = _codebook_dim != dim
         self.project_in = weight_norm(nn.Linear(dim, _codebook_dim)) if requires_projection else nn.Identity()
         self.project_out = weight_norm(nn.Linear(_codebook_dim, dim)) if requires_projection else nn.Identity()
-
         self.epsilon = epsilon
-        self.commitment_weight = commitment_weight
 
         self._codebook = EuclideanCodebook(
             dim=_codebook_dim,
@@ -331,6 +355,7 @@ class VectorQuantization(nn.Module):
             decay=decay,
             epsilon=epsilon,
             threshold_ema_dead_code=threshold_ema_dead_code,
+            affine_transform=affine_transform,
         )
         self.codebook_size = codebook_size
 
@@ -354,29 +379,39 @@ class VectorQuantization(nn.Module):
         quantize = quantize.permute(0, 2, 1)
         return quantize
 
+    def beamsearch(self, x, num_beams: int = 2):
+        # x \in bxn d
+        x = self.project_in(x)
+        distance, quantize, embed_ind = self._codebook.beamsearch(x, num_beams=num_beams)
+        quantize = torch.stack([self.project_out(q) for q in quantize], dim=1)  # [BxNxD]
+        return distance, quantize, embed_ind
+
     @torch.jit.ignore
-    def forward(self, x):
-        device = x.device
-        x = rearrange(x, "b d n -> b n d")
+    def forward(self, x, indices: tp.Optional[torch.Tensor] = None):
         x = self.project_in(x)
 
-        quantize, embed_ind, diversity_loss = self._codebook(x)
+        quantize, embed_ind, diversity_loss = self._codebook(x, indices=indices)
+
         # if self.training:
         #     warnings.warn('When using RVQ in training model, first check '
         #                   'https://github.com/facebookresearch/encodec/issues/25 . '
         #                   'The bug wasn\'t fixed here for reproducibility.')
-        if self.commitment_weight > 0:
-            commitment_loss = self.commitment_weight * F.mse_loss(quantize.detach(), x, reduction="mean")
-        else:
-            commitment_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
+        commitment_loss = F.mse_loss(quantize.detach(), x, reduction="mean")
         codebook_loss = F.mse_loss(quantize, x.detach(), reduction="mean")
 
         if self.training:
             quantize = x + (quantize - x).detach()
 
         quantize = self.project_out(quantize)
-        quantize = rearrange(quantize, "b n d -> b d n")
         return quantize, embed_ind, commitment_loss, codebook_loss, diversity_loss
+
+
+def gather_seq(x: torch.Tensor, indices: torch.Tensor):
+    bsz, seqlen, dim = x.shape
+    index = torch.cumsum(torch.tensor([seqlen] * bsz).type_as(indices), dim=0).unsqueeze(dim=1)
+    indices = indices + (index - seqlen)
+    gathered = torch.index_select(x.contiguous().view([bsz * seqlen, dim]), dim=0, index=indices.flatten())
+    return gathered.reshape([bsz, indices.shape[1], dim])
 
 
 class ResidualVectorQuantization(nn.Module):
@@ -388,9 +423,49 @@ class ResidualVectorQuantization(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([VectorQuantization(**kwargs) for _ in range(num_quantizers)])
 
+    @torch.no_grad()
+    def beamsearch(self, x: torch.Tensor, n_q: int = 2, num_beams: int = 1):
+        x = rearrange(x, "b d n -> b n d")
+        D = x.shape[-1]  # D
+        x = x.reshape([-1, D])  # BxD, B=bxn
+        # N = num_beams
+        # BxN
+        distances, quantizes, indices = self.layers[0].beamsearch(x, num_beams=num_beams)
+        all_indices = [indices]
+
+        residual = x.unsqueeze(1) - quantizes  # BxNxD
+        for q, layer in enumerate(self.layers[1:n_q]):
+            # (BxN)xN
+            distances2, quantizes, _indices = layer.beamsearch(residual.reshape([-1, D]), num_beams=num_beams)
+            distances = distances.unsqueeze(-1) + distances2.reshape([-1, num_beams, num_beams])
+            distances, mini = torch.topk(
+                distances.reshape([-1, num_beams * num_beams]), num_beams, dim=1, largest=False
+            )  # BxNxN -> BxN
+            _indices = torch.gather(_indices.reshape([-1, num_beams * num_beams]), dim=1, index=mini)
+            quantizes = gather_seq(quantizes.reshape([-1, num_beams * num_beams, D]), mini)
+
+            mini = mini // num_beams
+            residual = gather_seq(residual, mini) - quantizes  # BxNxD
+            # Update all_indices
+            for k, __indices in enumerate(all_indices):
+                all_indices[k] = torch.gather(__indices, dim=1, index=mini)
+            all_indices.append(_indices)
+
+        out_indices = torch.stack(all_indices, dim=-1)[:, 0]  # (BN) Q
+        return out_indices.permute(1, 0)  # [Q, BxN]
+
     @torch.jit.ignore
-    def forward(self, x, n_q: tp.Optional[int] = None):
-        quantized_first, indices, commitment_loss, codebook_loss, diversity_loss = self.layers[0](x)
+    def forward(self, x, n_q: tp.Optional[int] = None, num_beams: int = 1):
+        n_q = n_q or len(self.layers)
+        if num_beams > 0 and n_q > 0:
+            out_indices = self.beamsearch(x, n_q, num_beams)
+        else:
+            out_indices = [None] * n_q
+
+        x = rearrange(x, "b d n -> b n d")
+        quantized_first, indices, commitment_loss, codebook_loss, diversity_loss = self.layers[0](
+            x, indices=out_indices[0]
+        )
 
         all_commitment_losses, all_codebook_losses, all_diversity_losses = (
             [commitment_loss],
@@ -398,14 +473,14 @@ class ResidualVectorQuantization(nn.Module):
             [diversity_loss],
         )
         all_indices = [indices]
-        quantized_first = quantized_first.detach()
+
         residual = x - quantized_first
         quantized_out = quantized_first
 
-        n_q = n_q or len(self.layers)
         for q, layer in enumerate(self.layers[1:n_q]):
-            quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(residual)
-            quantized = quantized.detach()
+            quantized, indices, commitment_loss, codebook_loss, diversity_loss = layer(
+                residual, indices=out_indices[1 + q]
+            )
             residual = residual - quantized
             quantized_out = quantized_out + quantized
 
@@ -418,18 +493,29 @@ class ResidualVectorQuantization(nn.Module):
             # Solving subtle bug with STE and RVQ: https://github.com/facebookresearch/encodec/issues/25
             quantized_out = x + (quantized_out - x).detach()
 
+        # if num_beams > 0 and n_q > 0:
+        #     _out_indices = torch.stack(all_indices, dim=0)
+        #     assert torch.all(_out_indices == out_indices.reshape([n_q, x.shape[0], x.shape[1]]))
+
         commitment_loss, codebook_loss, diversity_loss, out_indices = map(
             torch.stack, (all_commitment_losses, all_codebook_losses, all_diversity_losses, all_indices)
         )
+        quantized_out = rearrange(quantized_out, "b n d -> b d n")
+        quantized_first = rearrange(quantized_first, "b n d -> b d n")
         return quantized_out, out_indices, commitment_loss, codebook_loss, diversity_loss, quantized_first
 
     @torch.jit.export
-    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None) -> torch.Tensor:
-        residual = x
-        all_indices = []
+    def encode(self, x: torch.Tensor, n_q: tp.Optional[int] = None, num_beams: int = 1) -> torch.Tensor:
         # n_q = n_q or len(self.layers)
         if n_q is None:
             n_q = len(self.layers)
+
+        if num_beams > 1 and n_q > 1:
+            out_indices = self.beamsearch(x, n_q, num_beams)
+            return out_indices.reshape([n_q, x.shape[0], x.shape[-1]])  # [Q, B, N]
+
+        residual = x
+        all_indices = []
         for i in range(n_q):
             layer: VectorQuantization = self.layers[i]
             indices = layer.encode(residual)

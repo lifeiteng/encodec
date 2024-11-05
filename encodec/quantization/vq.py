@@ -41,6 +41,7 @@ class ResidualVectorQuantizer(nn.Module):
         threshold_ema_dead_code (float): Threshold for dead code expiration. Replace any codes
             that have an exponential moving average cluster size less than the specified threshold with
             randomly selected vector from the current batch.
+        affine_transform: (bool): whether apply AffineTransform on coodbook.
     """
 
     def __init__(
@@ -54,7 +55,7 @@ class ResidualVectorQuantizer(nn.Module):
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: float = 2.0,
-        commitment_weight: float = 1.0,
+        affine_transform: bool = False,
     ):
         super().__init__()
         self.n_q = n_q
@@ -75,18 +76,24 @@ class ResidualVectorQuantizer(nn.Module):
             kmeans_init=self.kmeans_init,
             kmeans_iters=self.kmeans_iters,
             threshold_ema_dead_code=self.threshold_ema_dead_code,
-            commitment_weight=commitment_weight,
+            affine_transform=affine_transform,
         )
 
     @torch.jit.ignore
     def forward(
-        self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None, n_q: int = 0
+        self,
+        x: torch.Tensor,
+        frame_rate: int,
+        bandwidth: tp.Optional[float] = None,
+        n_q: int = 0,
+        num_beams: int = 0,
     ) -> QuantizedResult:
         """Residual vector quantization on the given input tensor.
         Args:
             x (torch.Tensor): Input tensor.
             frame_rate (int): Sample rate of the input tensor.
             bandwidth (float): Target bandwidth.
+            num_beams: Number of beams to use for the quantization.
         Returns:
             QuantizedResult:
                 The quantized (or approximately quantized) representation with
@@ -96,15 +103,17 @@ class ResidualVectorQuantizer(nn.Module):
         if not n_q:
             n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
 
-        quantized, codes, commitment_loss, codebook_loss, diversity_loss, quantized_first = self.vq(x, n_q=n_q)
+        quantized, codes, commitment_loss, codebook_loss, diversity_loss, quantized_first = self.vq(
+            x, n_q=n_q, num_beams=num_beams
+        )
         bw = torch.tensor(n_q * bw_per_q).to(x)
         return QuantizedResult(
             quantized,
             codes,
             bw,
-            commitment_loss=torch.mean(commitment_loss),
-            codebook_loss=torch.mean(codebook_loss),
-            diversity_loss=torch.mean(diversity_loss),
+            commitment_loss=commitment_loss,
+            codebook_loss=codebook_loss,
+            diversity_loss=diversity_loss,
             quantized_first=quantized_first,
         )
 
@@ -126,7 +135,7 @@ class ResidualVectorQuantizer(nn.Module):
 
     @torch.jit.export
     def encode(
-        self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None, n_q: int = 0
+        self, x: torch.Tensor, frame_rate: int, bandwidth: tp.Optional[float] = None, n_q: int = 0, num_beams: int = 0
     ) -> torch.Tensor:
         """Encode a given input tensor with the specified frame rate at the given bandwidth.
         The RVQ encode method sets the appropriate number of quantizers to use
@@ -134,7 +143,7 @@ class ResidualVectorQuantizer(nn.Module):
         """
         if not n_q:
             n_q = self.get_num_quantizers_for_bandwidth(frame_rate, bandwidth)
-        codes = self.vq.encode(x, n_q=n_q)
+        codes = self.vq.encode(x, n_q=n_q, num_beams=num_beams)
         return codes
 
     @torch.jit.export
